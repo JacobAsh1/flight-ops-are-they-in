@@ -1,26 +1,19 @@
 // AreTheyIn API — Railway-ready (ESM)
-// Robust parsers for all columns + exact "Updated" string logging.
-// If you still ever see "MM/dd HH:mm", we bypass any template string
-// by grabbing the cell's raw HTML and stripping entities manually.
-
+// Fixed version with better type safety and iOS compatibility
 import express from "express";
 import axios from "axios";
 import * as cheerio from "cheerio";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
 const SOURCE_URL =
   "https://aretheyin.boldmethod.com/index.aspx?op=public&sid=d2f78e63-1fb3-40ae-957f-920d2a455d85";
-
 const POLL_MS = Number(process.env.POLL_MS || 60_000);
-const LOG_SAMPLE = process.env.LOG_SAMPLE === "1"; // set to 1 to log first few raw cells
+const LOG_SAMPLE = process.env.LOG_SAMPLE === "1";
 
 // -------------------------------
 // Helpers
 // -------------------------------
-
-// Safe whitespace/entity cleanup (handles \u00A0 from &nbsp;)
 const decode = (s) =>
   (s ?? "")
     .replace(/\u00A0|&nbsp;/g, " ")
@@ -32,37 +25,36 @@ const decode = (s) =>
     .replace(/\n\s+/g, "\n")
     .trim();
 
-// Pull visible text AND, if needed, raw HTML (to defeat template placeholders)
 function extractCellText($, td) {
   const text = decode($(td).text());
-  // If the text suspiciously looks like a format token, try from HTML
   if (/^MM\/dd(\s+)HH:mm$/i.test(text) || text === "" || text === "—") {
     const html = $(td).html() || "";
-    // strip tags, collapse entities/nbsp
     const stripped = decode(html.replace(/<[^>]*>/g, ""));
-    return stripped || text; // prefer stripped; fall back to original text
+    return stripped || text;
   }
   return text;
 }
 
-// Name — Title split (supports hyphen/en dash/em dash)
 function splitNameAndTitle(raw) {
   const t = decode(raw);
   if (!t) return { name: null, title: null };
   const parts = t.split(/\s*[-–—]\s+/);
   if (parts.length >= 2) {
-    return { name: parts.shift()?.trim() || null, title: parts.join(" - ").trim() || null };
+    return { 
+      name: parts.shift()?.trim() || null, 
+      title: parts.join(" - ").trim() || null 
+    };
   }
   return { name: t, title: null };
 }
 
-// Phone sanitizer
 function parsePhone(raw) {
   const text = decode(raw);
   if (!text) return { raw: null, digits: null, e164: null, pretty: null };
+  
   const digits = text.replace(/\D+/g, "");
   if (!digits) return { raw: text, digits: null, e164: null, pretty: text };
-
+  
   if (digits.length === 10) {
     const e164 = `+1${digits}`;
     const pretty = `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}`;
@@ -72,14 +64,18 @@ function parsePhone(raw) {
     const pretty = `${digits.slice(0, 3)}-${digits.slice(3)}`;
     return { raw: text, digits, e164: null, pretty };
   }
-  return { raw: text, digits, e164: digits.length >= 11 ? `+${digits}` : null, pretty: text };
+  return { 
+    raw: text, 
+    digits, 
+    e164: digits.length >= 11 ? `+${digits}` : null, 
+    pretty: text 
+  };
 }
 
-// Returning column (times like "1145", "9:30 AM", or free text like "Thu PM mod")
 function parseReturning(raw) {
   const text = decode(raw);
   if (!text) return { raw: null, hhmm: null, pretty: null, tokens: [] };
-
+  
   // Pure HHMM / HMM
   if (/^\d{3,4}$/.test(text)) {
     const padded = text.padStart(4, "0");
@@ -88,61 +84,61 @@ function parseReturning(raw) {
     const pretty = `${Number(hh)}:${mm}`;
     return { raw: text, hhmm: `${hh}:${mm}`, pretty, tokens: [pretty] };
   }
-
+  
   // e.g., "9:30 AM"
   const m = text.match(/\b(\d{1,2}):?(\d{2})?\s*(AM|PM)\b/i);
   if (m) {
     const h = m[1].padStart(2, "0");
     const mm = (m[2] || "00").padStart(2, "0");
     const ampm = m[3].toUpperCase();
-    return { raw: text, hhmm: `${h}:${mm}`, pretty: `${Number(h)}:${mm} ${ampm}`, tokens: [ampm] };
+    return { 
+      raw: text, 
+      hhmm: `${h}:${mm}`, 
+      pretty: `${Number(h)}:${mm} ${ampm}`, 
+      tokens: [ampm] 
+    };
   }
-
-  // Tokens for keywords (Thu/Thurs, AM/PM, Meeting, Campus, etc.)
+  
   const tokens = (text.match(/[A-Za-z]+/g) || []).map((t) => t);
   return { raw: text, hhmm: null, pretty: text, tokens };
 }
 
-// Updated column — keep exact string, but also offer an ISO guess
 function parseUpdatedFromCell($, td) {
   const text = extractCellText($, td);
-
-  // If something still returns a format token, we treat it as missing
+  
   if (/^MM\/dd(\s+)HH:mm$/i.test(text)) {
     return { local: null, isoGuess: null, epochMs: null, debug: "FormatTokenSeen" };
   }
-
-  // Try a best-effort Date parse for ISO (timezone-naive)
+  
   let isoGuess = null;
   let epochMs = null;
+  
   if (text) {
     const d = new Date(text);
     if (!Number.isNaN(d.getTime())) {
       isoGuess = d.toISOString();
+      // CRITICAL FIX: Ensure epochMs is always a number or null (never NaN)
       epochMs = d.getTime();
+      if (Number.isNaN(epochMs) || !Number.isFinite(epochMs)) {
+        epochMs = null;
+      }
     }
   }
+  
   return { local: text || null, isoGuess, epochMs, debug: null };
 }
 
-// Status normalization using both row class and cell text
 function normalizeStatus({ trClass, cellText }) {
   const c = (trClass || "").toLowerCase();
   const t = (cellText || "").toLowerCase();
-
-  const pick = (s) => ({
-    value: s,
-    isIn: s === "In",
-    isOut: s === "Out",
-    isUnavailable: s === "Unavailable"
-  });
-
-  if (/initem/.test(c) || /^in$/.test(t)) return pick("In");
-  if (/outitem/.test(c) || /^out$/.test(t)) return pick("Out");
-  if (/unavailable/.test(c) || /^unavailable$/.test(t)) return pick("Unavailable");
-
-  const pretty = t ? t[0].toUpperCase() + t.slice(1) : "Unknown";
-  return pick(pretty);
+  
+  // CRITICAL FIX: Ensure status values match Swift enum EXACTLY
+  if (/initem/.test(c) || /^in$/.test(t)) return "In";
+  if (/outitem/.test(c) || /^out$/.test(t)) return "Out";
+  if (/unavailable/.test(c) || /^unavailable$/.test(t)) return "Unavailable";
+  
+  // Return Unknown as fallback (matches Swift enum)
+  return "Unknown";
 }
 
 // -------------------------------
@@ -157,6 +153,9 @@ function rowToRecord($, tr) {
   const idFromHidden = extractCellText($, tds[0]);
   const idFromAttr = ($tr.attr("id") || "").replace(/^Row/, "");
   const id = idFromHidden || idFromAttr || null;
+  
+  // CRITICAL FIX: Skip records without valid IDs
+  if (!id) return null;
 
   const statusCellText = extractCellText($, tds[1]);
   const status = normalizeStatus({ trClass, cellText: statusCellText });
@@ -168,16 +167,15 @@ function rowToRecord($, tr) {
   const phone = parsePhone(contactRaw);
 
   const remarks = extractCellText($, tds[4]) || null;
-
   const returning = parseReturning(extractCellText($, tds[5]));
-
   const updated = parseUpdatedFromCell($, tds[6]);
 
+  // CRITICAL FIX: Ensure all nested objects have proper null handling
   return {
     id,
-    status: status.value, // "In" | "Out" | "Unavailable" | "Unknown"
-    name,
-    title,
+    status,
+    name: name || null,
+    title: title || null,
     contact: {
       raw: phone.raw,
       digits: phone.digits,
@@ -185,16 +183,26 @@ function rowToRecord($, tr) {
       pretty: phone.pretty
     },
     remarks,
-    returning, // { raw, hhmm, pretty, tokens }
-    updated,   // { local, isoGuess, epochMs, debug }
+    returning: {
+      raw: returning.raw,
+      hhmm: returning.hhmm,
+      pretty: returning.pretty,
+      tokens: returning.tokens || []
+    },
+    updated: {
+      local: updated.local,
+      isoGuess: updated.isoGuess,
+      epochMs: updated.epochMs, // Now guaranteed to be number or null
+      debug: updated.debug
+    },
     meta: {
-      trClass,
+      trClass: trClass || null,
       rowIdAttr: $tr.attr("id") || null,
       parsedAt: new Date().toISOString(),
       flags: {
-        isIn: status.isIn,
-        isOut: status.isOut,
-        isUnavailable: status.isUnavailable
+        isIn: status === "In",
+        isOut: status === "Out",
+        isUnavailable: status === "Unavailable"
       }
     }
   };
@@ -209,14 +217,18 @@ async function fetchBoard() {
       headers: { "User-Agent": "AreTheyInAPI/1.0 (+railway)" },
       timeout: 20_000
     });
-
+    
     const $ = cheerio.load(html);
-
     const rows = $("tr[id^='Row'], tr[class*='Item']:has(td.OtlkItem)");
     const items = [];
+
     rows.each((i, tr) => {
       const rec = rowToRecord($, tr);
-      if (rec && rec.id) items.push(rec);
+      // CRITICAL FIX: Only add records with valid IDs
+      if (rec && rec.id) {
+        items.push(rec);
+      }
+      
       if (LOG_SAMPLE && i < 3) {
         const rawHtml = $(tr).find("td.OtlkItem").eq(6).html() || "";
         console.log("[DEBUG UpdatedCell rawHTML]", rawHtml);
@@ -225,20 +237,25 @@ async function fetchBoard() {
     });
 
     // Dedup by id, keep last
-    const deduped = Object.values(items.reduce((acc, r) => ((acc[r.id] = r), acc), {}));
+    const deduped = Object.values(
+      items.reduce((acc, r) => ((acc[r.id] = r), acc), {})
+    );
 
     // Sort by status then name
-    const order = { in: 0, out: 1, unavailable: 2, unknown: 3 };
+    const order = { In: 0, Out: 1, Unavailable: 2, Unknown: 3 };
     deduped.sort((a, b) => {
-      const aK = order[a.status.toLowerCase()] ?? 99;
-      const bK = order[b.status.toLowerCase()] ?? 99;
+      const aK = order[a.status] ?? 99;
+      const bK = order[b.status] ?? 99;
       if (aK !== bK) return aK - bK;
       return (a.name || "").localeCompare(b.name || "");
     });
 
-    cache = { lastFetched: new Date().toISOString(), items: deduped, error: null };
+    cache = { 
+      lastFetched: new Date().toISOString(), 
+      items: deduped, 
+      error: null 
+    };
 
-    // Console output — IMPORTANT: log the exact site string for Updated.
     console.clear();
     console.log(`[AreTheyIn] ${cache.lastFetched}  —  ${deduped.length} rows`);
     console.table(
@@ -253,7 +270,10 @@ async function fetchBoard() {
       }))
     );
   } catch (err) {
-    cache.error = { message: err?.message || "Unknown error", time: new Date().toISOString() };
+    cache.error = { 
+      message: err?.message || "Unknown error", 
+      time: new Date().toISOString() 
+    };
     console.error("[AreTheyIn] Fetch error:", cache.error.message);
   }
 }
@@ -264,6 +284,17 @@ async function fetchBoard() {
 (async () => {
   await fetchBoard();
   setInterval(fetchBoard, POLL_MS);
+
+  // CORS headers for iOS
+  app.use((req, res, next) => {
+    res.header("Access-Control-Allow-Origin", "*");
+    res.header("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.header("Access-Control-Allow-Headers", "Content-Type");
+    if (req.method === "OPTIONS") {
+      return res.sendStatus(200);
+    }
+    next();
+  });
 
   app.get("/", (_req, res) => {
     res.json({
@@ -276,11 +307,26 @@ async function fetchBoard() {
   });
 
   app.get("/api/status", (_req, res) => {
-    res.json({ lastFetched: cache.lastFetched, items: cache.items, error: cache.error });
+    // CRITICAL FIX: Ensure response structure matches Swift expectations
+    res.json({
+      lastFetched: cache.lastFetched,
+      items: cache.items,
+      error: cache.error
+    });
   });
 
   app.get("/api/health", (_req, res) => {
     res.json({ ok: true, time: new Date().toISOString() });
+  });
+
+  // Debug endpoint to see raw JSON
+  app.get("/api/debug", (_req, res) => {
+    res.set("Content-Type", "text/plain");
+    res.send(JSON.stringify({
+      lastFetched: cache.lastFetched,
+      items: cache.items,
+      error: cache.error
+    }, null, 2));
   });
 
   app.listen(PORT, () => console.log(`[AreTheyIn] API listening on :${PORT}`));
